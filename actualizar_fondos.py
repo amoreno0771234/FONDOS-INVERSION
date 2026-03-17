@@ -1,9 +1,9 @@
 """
-actualizar_fondos.py  v3
+actualizar_fondos.py  v4
 ────────────────────────
-Usa la API interna de Morningstar (time series de precios NAV)
-para calcular rentabilidades reales: YTD, 1M, 3M, 1Y.
-No hay scraping HTML → más estable y sin bloqueos.
+Usa el screener de Morningstar que devuelve directamente
+rentabilidades, NAV, duración y YTM sin necesidad de series temporales.
+Funciona para fondos de cualquier domicilio (FR, LU, IE, ES...).
 """
 
 import os, time, datetime, smtplib, logging
@@ -68,154 +68,95 @@ ISIN_A_MS = {
     "LU0243957239": "F0GBR04QEG",
 }
 
-# ─── OBTENER SERIE DE PRECIOS NAV DE MORNINGSTAR ─────────────────────────
-def obtener_serie_nav(ms_id: str) -> list:
-    """
-    Llama a la API de series temporales de Morningstar.
-    Devuelve lista de [fecha_str, precio] ordenada por fecha ascendente.
-    """
-    hoy       = datetime.date.today()
-    hace_14m  = hoy - datetime.timedelta(days=430)  # 14 meses atrás
 
+def _f(val):
+    """Convierte a float de forma segura."""
+    if val is None or val == "":
+        return None
+    try:
+        return float(str(val).replace(",", ".").replace("%", "").strip())
+    except (ValueError, TypeError):
+        return None
+
+
+# ─── OBTENER DATOS VÍA SCREENER DE MORNINGSTAR ───────────────────────────
+def obtener_datos(ms_id: str) -> dict:
+    """
+    Usa el screener de Morningstar ES que devuelve en una sola llamada:
+    NAV, YTD, 1M, 3M, 1Y, estrellas, duración efectiva y YTM.
+    Funciona para todos los dominios de fondo (FR, LU, IE, ES...).
+    """
+    campos = (
+        "SecId|LegalName|StarRating|Nav|NavDate"
+        "|GBRReturnM0|GBRReturnM1|GBRReturnM3|GBRReturnM12"
+        "|EffectiveDuration|YieldToMaturity|CreditRating"
+    )
     url = (
-        f"https://tools.morningstar.es/api/rest.svc/timeseries_price/9coxbuqx31"
-        f"?id={ms_id}]2]0]FOESP$$ALL"
-        f"&currencyId=EUR&idtype=Morningstar"
-        f"&frequency=daily"
-        f"&startDate={hace_14m.strftime('%Y-%m-%d')}"
-        f"&endDate={hoy.strftime('%Y-%m-%d')}"
-        f"&outputType=json"
+        "https://tools.morningstar.es/api/rest.svc/klr5zyak8x/security/screener"
+        "?page=1&pageSize=1&sortOrder=LegalName+asc&outputType=json"
+        "&version=1&languageId=es-ES&currencyId=EUR"
+        "&universeIds=FOESP%24%24ALL%7CFOEUR%24%24ALL%7CFOIRL%24%24ALL%7CFOGBR%24%24ALL"
+        f"&securityDataPoints={campos.replace('|', '%7C')}"
+        f"&filters=SecId%3AIN%3A{ms_id}"
     )
     try:
         r = requests.get(url, headers=HEADERS, timeout=20)
         if r.status_code != 200:
-            log.debug(f"Serie NAV {ms_id}: status {r.status_code}")
-            return []
-        data = r.json()
-        series = data.get("TimeSeries", {}).get("Security", [])
-        if not series:
-            return []
-        historial = series[0].get("HistoryDetail", [])
-        precios = []
-        for punto in historial:
-            fecha = punto.get("EndDate", "")
-            val   = punto.get("Value")
-            if fecha and val is not None:
-                try:
-                    precios.append((fecha, float(val)))
-                except (ValueError, TypeError):
-                    pass
-        return sorted(precios, key=lambda x: x[0])
-    except Exception as e:
-        log.warning(f"Serie NAV {ms_id}: {e}")
-        return []
-
-
-def calcular_rentabilidades(precios: list) -> dict:
-    """Calcula NAV actual, YTD, 1M, 3M, 1Y a partir de la serie de precios."""
-    if not precios:
-        return {}
-
-    hoy_str     = precios[-1][0]
-    nav_actual  = precios[-1][1]
-    hoy_dt      = datetime.datetime.strptime(hoy_str[:10], "%Y-%m-%d").date()
-
-    def precio_hace(dias: int):
-        fecha_ref = hoy_dt - datetime.timedelta(days=dias)
-        # Buscar el precio más cercano anterior a fecha_ref
-        candidatos = [(f, p) for f, p in precios
-                      if datetime.datetime.strptime(f[:10], "%Y-%m-%d").date() <= fecha_ref]
-        return candidatos[-1][1] if candidatos else None
-
-    def precio_inicio_anio():
-        anio = str(hoy_dt.year)
-        candidatos = [(f, p) for f, p in precios if f[:4] == anio]
-        return candidatos[0][1] if candidatos else None
-
-    def pct(p0):
-        if p0 is None or p0 == 0:
-            return None
-        return round((nav_actual / p0 - 1) * 100, 2)
-
-    p_inicio = precio_inicio_anio()
-    p_1m     = precio_hace(30)
-    p_3m     = precio_hace(90)
-    p_1y     = precio_hace(365)
-
-    resultado = {"nav": round(nav_actual, 4), "fecha_nav": hoy_str[:10]}
-    if p_inicio: resultado["ytd"] = pct(p_inicio)
-    if p_1m:     resultado["1m"]  = pct(p_1m)
-    if p_3m:     resultado["3m"]  = pct(p_3m)
-    if p_1y:     resultado["1y"]  = pct(p_1y)
-
-    return resultado
-
-
-# ─── OBTENER DATOS ADICIONALES (rating, duración, YTM) ───────────────────
-def obtener_datos_extra(ms_id: str) -> dict:
-    """
-    Usa el endpoint de datos fundamentales de Morningstar.
-    """
-    datos = {}
-    url = (
-        f"https://tools.morningstar.es/api/rest.svc/klr5zyak8x/security/screener"
-        f"?page=1&pageSize=1&sortOrder=LegalName+asc&outputType=json"
-        f"&version=1&languageId=es-ES&currencyId=EUR"
-        f"&universeIds=FOESP%24%24ALL%7CFOEUR%24%24ALL"
-        f"&securityDataPoints=SecId%7CLegalName%7CStarRating%7CCreditRating"
-        f"%7CEffectiveDuration%7CYieldToMaturity%7CNav%7CGBRReturnM0"
-        f"%7CGBRReturnM1%7CGBRReturnM3%7CGBRReturnM12"
-        f"&filters=SecId%3AIN%3A{ms_id}"
-    )
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
-        if r.status_code != 200:
-            return datos
+            log.warning(f"Screener {ms_id}: status {r.status_code}")
+            return {}
         data = r.json()
         rows = data.get("rows", [])
         if not rows:
-            return datos
-        row = rows[0]
+            log.warning(f"Screener {ms_id}: sin resultados")
+            return {}
 
-        if row.get("StarRating"):
+        row = rows[0]
+        datos = {}
+
+        nav = _f(row.get("Nav"))
+        if nav:
+            datos["nav"] = nav
+        if row.get("NavDate"):
+            datos["fecha_nav"] = str(row["NavDate"])[:10]
+
+        for key, campo in [
+            ("ytd", "GBRReturnM0"),
+            ("1m",  "GBRReturnM1"),
+            ("3m",  "GBRReturnM3"),
+            ("1y",  "GBRReturnM12"),
+        ]:
+            v = _f(row.get(campo))
+            if v is not None:
+                datos[key] = v
+
+        dur = _f(row.get("EffectiveDuration"))
+        if dur is not None:
+            datos["duracion"] = dur
+
+        ytm = _f(row.get("YieldToMaturity"))
+        if ytm is not None:
+            datos["ytm"] = ytm
+
+        stars = row.get("StarRating")
+        if stars:
             try:
-                datos["estrellas"] = int(row["StarRating"])
+                datos["estrellas"] = int(stars)
             except (ValueError, TypeError):
                 pass
-        if row.get("EffectiveDuration"):
-            try:
-                datos["duracion"] = float(row["EffectiveDuration"])
-            except (ValueError, TypeError):
-                pass
-        if row.get("YieldToMaturity"):
-            try:
-                datos["ytm"] = float(row["YieldToMaturity"])
-            except (ValueError, TypeError):
-                pass
-        # Rentabilidades de respaldo (si la serie no devolvió datos)
-        for key, campo in [("ytd","GBRReturnM0"),("1m","GBRReturnM1"),
-                           ("3m","GBRReturnM3"),("1y","GBRReturnM12")]:
-            if row.get(campo) is not None:
-                try:
-                    datos[key] = float(row[campo])
-                except (ValueError, TypeError):
-                    pass
-        if row.get("Nav"):
-            try:
-                datos["nav_extra"] = float(row["Nav"])
-            except (ValueError, TypeError):
-                pass
+
+        return datos
 
     except Exception as e:
-        log.debug(f"Datos extra {ms_id}: {e}")
-
-    return datos
+        log.warning(f"Screener {ms_id}: {e}")
+        return {}
 
 
 # ─── ACTUALIZAR EXCEL ─────────────────────────────────────────────────────
 AZUL_CL = "D6E4F0"
 BLANCO  = "FFFFFF"
 AZUL_H  = "1F4E79"
+VERDE   = "E2EFDA"
+ROJO    = "FCE4D6"
 thin = Border(
     left=Side(style="thin", color="BFBFBF"),
     right=Side(style="thin", color="BFBFBF"),
@@ -245,6 +186,13 @@ def celda(ws, row, col, valor, bg, fmt=None, bold=False):
     return c
 
 
+def color_rentabilidad(valor):
+    """Verde si positivo, rojo si negativo."""
+    if valor is None:
+        return BLANCO
+    return VERDE if valor >= 0 else ROJO
+
+
 def actualizar_excel():
     wb  = load_workbook(EXCEL_PATH)
     ws  = wb["Fondos - Datos Completos"]
@@ -267,8 +215,11 @@ def actualizar_excel():
         ws.column_dimensions[get_column_letter(col)].width = 10
 
     fondos_ok = 0
+    fondos_sin_datos = []
+
     for row in range(3, ws.max_row + 1):
         isin = ws.cell(row=row, column=2).value
+        nombre = ws.cell(row=row, column=1).value
         if not isin or str(isin).strip() == "":
             continue
         isin   = str(isin).strip()
@@ -276,84 +227,106 @@ def actualizar_excel():
 
         ms_id = ISIN_A_MS.get(isin)
         if not ms_id:
-            log.warning(f"Sin ID Morningstar: {isin}")
+            log.warning(f"Sin ID Morningstar: {isin} ({nombre})")
+            fondos_sin_datos.append(f"{nombre} (sin ID)")
             celda(ws, row, COL_ACTUALIZ, hoy, bg_row)
             continue
 
         log.info(f"  {isin} → {ms_id}")
+        datos = obtener_datos(ms_id)
+        time.sleep(0.8)
 
-        # Serie de precios NAV → rentabilidades
-        precios = obtener_serie_nav(ms_id)
-        datos   = calcular_rentabilidades(precios)
+        if not datos:
+            fondos_sin_datos.append(f"{nombre}")
+            celda(ws, row, COL_ACTUALIZ, hoy, bg_row)
+            continue
 
-        # Datos extra (estrellas, duración, YTM)
-        extra = obtener_datos_extra(ms_id)
-        time.sleep(1.0)
-
-        # Combinar: datos de serie tienen prioridad para rentabilidades
-        for k in ["ytd", "1m", "3m", "1y"]:
-            if k not in datos and k in extra:
-                datos[k] = extra[k]
-        if "nav" not in datos and "nav_extra" in extra:
-            datos["nav"] = extra["nav_extra"]
-        for k in ["estrellas", "duracion", "ytm"]:
-            if k in extra:
-                datos[k] = extra[k]
-
-        # Escribir en Excel
+        # NAV
         if datos.get("nav"):
             celda(ws, row, COL_NAV, datos["nav"], bg_row, fmt="#,##0.0000")
+
+        # YTD — en columna 25, con color
         if datos.get("ytd") is not None:
-            celda(ws, row, COL_YTD, datos["ytd"] / 100, bg_row, fmt="0.00%",
-                  bold=datos["ytd"] > 5)
+            bg_ytd = color_rentabilidad(datos["ytd"])
+            celda(ws, row, COL_YTD, datos["ytd"] / 100, bg_ytd, fmt="0.00%",
+                  bold=abs(datos["ytd"]) > 5)
+
+        # 1M, 3M, 1Y — con color verde/rojo
         for col, key in [(COL_1M,"1m"),(COL_3M,"3m"),(COL_1Y,"1y")]:
             if datos.get(key) is not None:
-                celda(ws, row, col, datos[key] / 100, bg_row, fmt="0.00%")
+                bg_r = color_rentabilidad(datos[key])
+                celda(ws, row, col, datos[key] / 100, bg_r, fmt="0.00%")
+
+        # Duración
         if datos.get("duracion") is not None:
             celda(ws, row, COL_DURACION, datos["duracion"], bg_row, fmt="0.00")
+
+        # YTM
         if datos.get("ytm") is not None:
             celda(ws, row, COL_YTM, datos["ytm"] / 100, bg_row, fmt="0.00%")
+
+        # Estrellas
         if datos.get("estrellas"):
             celda(ws, row, COL_ESTRELLAS, "⭐" * datos["estrellas"], bg_row)
 
         celda(ws, row, COL_ACTUALIZ, hoy, bg_row)
         fondos_ok += 1
-        log.info(f"    NAV={datos.get('nav')} YTD={datos.get('ytd')} 1M={datos.get('1m')} 3M={datos.get('3m')} 1Y={datos.get('1y')}")
+        log.info(
+            f"    ✓ NAV={datos.get('nav')} "
+            f"YTD={datos.get('ytd')}% "
+            f"1M={datos.get('1m')}% "
+            f"3M={datos.get('3m')}% "
+            f"1Y={datos.get('1y')}%"
+        )
+
+    if fondos_sin_datos:
+        log.warning(f"Fondos sin datos ({len(fondos_sin_datos)}): {', '.join(fondos_sin_datos)}")
 
     # Historial
     if "Historial" not in wb.sheetnames:
         wlog = wb.create_sheet("Historial")
-        for col, txt in [(1,"Fecha"),(2,"Fondos actualizados"),(3,"Notas")]:
+        for col, txt in [(1,"Fecha"),(2,"Fondos actualizados"),(3,"Sin datos"),(4,"Notas")]:
             wlog.cell(1, col, txt).font = Font(bold=True, name="Arial")
     else:
         wlog = wb["Historial"]
     nr = wlog.max_row + 1
     wlog.cell(nr, 1, hoy)
     wlog.cell(nr, 2, fondos_ok)
-    wlog.cell(nr, 3, "Actualización automática diaria v3")
+    wlog.cell(nr, 3, ", ".join(fondos_sin_datos) if fondos_sin_datos else "—")
+    wlog.cell(nr, 4, "Actualización automática v4")
 
     buf = BytesIO()
     wb.save(buf)
     buf.seek(0)
     wb.save(EXCEL_PATH)
-    log.info(f"Excel guardado — {fondos_ok} fondos actualizados.")
-    return buf, fondos_ok
+    log.info(f"✅ Excel guardado — {fondos_ok} fondos actualizados, {len(fondos_sin_datos)} sin datos.")
+    return buf, fondos_ok, fondos_sin_datos
 
 
 # ─── ENVIAR EMAIL ─────────────────────────────────────────────────────────
-def enviar_email(excel_bytes, fondos_ok):
+def enviar_email(excel_bytes, fondos_ok, fondos_sin_datos):
     hoy_str     = datetime.date.today().strftime("%d/%m/%Y")
     nombre_arch = f"fondos_inversion_{datetime.date.today():%Y%m%d}.xlsx"
 
     msg            = MIMEMultipart()
     msg["From"]    = EMAIL_REMITENTE
     msg["To"]      = EMAIL_DESTINO
-    msg["Subject"] = f"📊 Fondos de Inversión — Actualización {hoy_str}"
+    msg["Subject"] = f"📊 Fondos de Inversión — {hoy_str} ({fondos_ok} actualizados)"
+
+    sin_datos_html = ""
+    if fondos_sin_datos:
+        items = "".join(f"<li>{f}</li>" for f in fondos_sin_datos)
+        sin_datos_html = f"""
+        <p style="color:#888;font-size:12px">
+        ⚠️ Fondos sin datos disponibles en Morningstar:<br>
+        <ul style="font-size:11px">{items}</ul>
+        </p>
+        """
 
     cuerpo = f"""
     <html><body style="font-family:Arial,sans-serif;color:#333">
     <h2 style="color:#1F4E79">📊 Fondos de Inversión — {hoy_str}</h2>
-    <p>Se adjunta el Excel con <strong>{fondos_ok} fondos actualizados</strong>.</p>
+    <p>Excel actualizado con <strong>{fondos_ok} fondos</strong>.</p>
     <table style="border-collapse:collapse;margin:16px 0">
       <tr style="background:#1F4E79;color:white">
         <th style="padding:8px 16px">Dato</th><th style="padding:8px 16px">Estado</th>
@@ -364,7 +337,8 @@ def enviar_email(excel_bytes, fondos_ok):
       <tr style="background:#f2f2f2"><td style="padding:6px 16px">⭐ Estrellas Morningstar</td><td>✅ Actualizado</td></tr>
       <tr><td style="padding:6px 16px">⏱️ Duración y YTM</td><td>✅ Actualizado</td></tr>
     </table>
-    <p style="color:#888;font-size:12px">Fuente: Morningstar ES · GitHub Actions v3</p>
+    {sin_datos_html}
+    <p style="color:#888;font-size:11px">Fuente: Morningstar ES · GitHub Actions v4</p>
     </body></html>
     """
     msg.attach(MIMEText(cuerpo, "html"))
@@ -383,7 +357,7 @@ def enviar_email(excel_bytes, fondos_ok):
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("═══ Inicio actualización v3 ═══")
-    excel_buf, fondos_ok = actualizar_excel()
-    enviar_email(excel_buf, fondos_ok)
+    log.info("═══ Inicio actualización v4 ═══")
+    excel_buf, fondos_ok, sin_datos = actualizar_excel()
+    enviar_email(excel_buf, fondos_ok, sin_datos)
     log.info("═══ Proceso completado ═══")
