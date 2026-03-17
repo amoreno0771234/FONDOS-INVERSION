@@ -1,10 +1,8 @@
 """
-actualizar_fondos.py  v5
+actualizar_fondos.py  v6
 ────────────────────────
-Corrige:
-- NAV obtenido correctamente (campo correcto del screener)
-- Fondos F0GBR incluidos (universo FOGBR$$ALL añadido)
-- Consulta por lotes para mayor fiabilidad
+Busca cada fondo DIRECTAMENTE por ISIN en Morningstar.
+No depende de IDs hardcodeados que pueden estar desactualizados.
 """
 
 import os, time, datetime, smtplib, logging
@@ -35,42 +33,6 @@ HEADERS = {
     "Referer": "https://www.morningstar.es/",
 }
 
-# Todos los universos: España, Europa, Irlanda, UK, Global
-UNIVERSOS = "FOESP%24%24ALL%7CFOEUR%24%24ALL%7CFOIRL%24%24ALL%7CFOGBR%24%24ALL%7CFOEAA%24%24ALL"
-
-ISIN_A_MS = {
-    "FR0010830885": "F00000XNKY",
-    "FR0013399633": "F00001BSCK",
-    "LU1882449801": "F00001BHQK",
-    "LU0830528907": "F0GBR063CP",
-    "LU0906524193": "F00000YM0O",
-    "LU1706854152": "F00001BSIO",
-    "FR0011365212": "F00000VXBK",
-    "LU0658026603": "F00000NCI5",
-    "LU0151324422": "F0GBR04GYK",
-    "LU0252128276": "F0GBR04GYL",
-    "FR0014008AI4": "F00001DLBY",
-    "FR0014000J453": "F00001EO44",
-    "LU0336084032": "F0GBR04QEK",
-    "FR0010149120": "F0GBR04QEJ",
-    "LU1966822956": "F00001DTXY",
-    "LU1694789451": "F00001AK5D",
-    "LU0343303002": "F0GBR06BXC",
-    "LU1161527038": "F00000VXYT",
-    "FR0010334495": "F0GBR04QEO",
-    "LU0512127621": "F0GBR06BXX",
-    "IE0000BTZZE8": "F00001GBA5",
-    "IE000WFO9P18": "F00001HC6T",
-    "IE0000M5MJ59": "F00001EM4X",
-    "IE0000M53C66": "F00001GMLT",
-    "LU0300ZRW254": "F0GBR06BXR",
-    "IE00B84J9L26": "F00000OUQB",
-    "ES0173829047": "F0GBR04IFH",
-    "LU2917874104": "F00001N9KY",
-    "LU1551754515": "F00001AX9D",
-    "LU0243957239": "F0GBR04QEG",
-}
-
 
 def _f(val):
     if val is None or val == "":
@@ -81,100 +43,126 @@ def _f(val):
         return None
 
 
-def obtener_datos_lote(ids: list) -> dict:
+# ─── PASO 1: BUSCAR MS_ID POR ISIN ───────────────────────────────────────
+def buscar_id_por_isin(isin: str) -> tuple:
     """
-    Consulta el screener de Morningstar para un lote de IDs.
-    Devuelve dict {ms_id: {nav, ytd, 1m, 3m, 1y, duracion, ytm, estrellas}}
+    Busca el fondo en Morningstar por ISIN.
+    Devuelve (ms_id, nombre) o (None, None).
     """
-    if not ids:
-        return {}
-
-    # Campos a obtener — incluye Nav, NavOfDay y Price por si acaso
-    campos = (
-        "SecId|LegalName|StarRating"
-        "|Nav|NavOfDay|ClosePrice"
-        "|GBRReturnM0|GBRReturnM1|GBRReturnM3|GBRReturnM12"
-        "|EffectiveDuration|YieldToMaturity"
-    )
-
-    filtro = "SecId%3AIN%3A" + "%7C".join(ids)
-
     url = (
-        "https://tools.morningstar.es/api/rest.svc/klr5zyak8x/security/screener"
-        f"?page=1&pageSize={len(ids)}&sortOrder=LegalName+asc&outputType=json"
-        f"&version=1&languageId=es-ES&currencyId=EUR"
-        f"&universeIds={UNIVERSOS}"
-        f"&securityDataPoints={campos.replace('|', '%7C')}"
-        f"&filters={filtro}"
+        "https://www.morningstar.es/es/util/SecuritySearch.ashx"
+        f"?q={isin}&limit=5&universe=FOESP%24%24ALL%7CFOEUR%24%24ALL"
+        f"%7CFOIRL%24%24ALL%7CFOGBR%24%24ALL%7CFOEAA%24%24ALL"
+        "&lang=es-ES&fmt=json"
     )
-
     try:
-        r = requests.get(url, headers=HEADERS, timeout=25)
+        r = requests.get(url, headers=HEADERS, timeout=15)
         if r.status_code != 200:
-            log.warning(f"Screener lote: status {r.status_code}")
-            return {}
+            return None, None
         data = r.json()
-        rows = data.get("rows", [])
+        resultados = data.get("r", [])
+        if resultados:
+            mejor = resultados[0]
+            return mejor.get("id"), mejor.get("n", "")
     except Exception as e:
-        log.warning(f"Screener lote: {e}")
-        return {}
+        log.debug(f"Búsqueda ISIN {isin}: {e}")
+    return None, None
 
-    resultado = {}
-    for row in rows:
-        sec_id = row.get("SecId")
-        if not sec_id:
-            continue
 
-        datos = {}
+# ─── PASO 2: OBTENER DATOS POR MS_ID ─────────────────────────────────────
+def obtener_datos_por_id(ms_id: str) -> dict:
+    """
+    Obtiene NAV, rentabilidades, duración, YTM y estrellas
+    usando el endpoint de ficha de Morningstar.
+    """
+    datos = {}
 
-        # NAV — intentar varios campos
-        for campo_nav in ["Nav", "NavOfDay", "ClosePrice"]:
-            v = _f(row.get(campo_nav))
-            if v and v > 0:
-                datos["nav"] = round(v, 4)
-                break
+    # Endpoint de rendimiento
+    url = (
+        f"https://www.morningstar.es/es/funds/snapshot/snapshot.aspx"
+        f"?id={ms_id}&tab=1"
+    )
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=20)
+        if r.status_code != 200:
+            return datos
 
-        # Rentabilidades
-        for key, campo in [
-            ("ytd", "GBRReturnM0"),
-            ("1m",  "GBRReturnM1"),
-            ("3m",  "GBRReturnM3"),
-            ("1y",  "GBRReturnM12"),
-        ]:
-            v = _f(row.get(campo))
-            if v is not None:
-                datos[key] = v
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(r.text, "html.parser")
 
-        # Duración y YTM
-        v = _f(row.get("EffectiveDuration"))
-        if v is not None:
-            datos["duracion"] = v
-        v = _f(row.get("YieldToMaturity"))
-        if v is not None:
-            datos["ytm"] = v
+        # NAV desde bloque de precio superior
+        for sel in ["div.snapshot-header span.price",
+                    "span.price", "td.price"]:
+            tag = soup.select_one(sel)
+            if tag:
+                v = _f(tag.get_text(strip=True).replace(".", "").replace(",", "."))
+                if v and 0.01 < v < 999999:
+                    datos["nav"] = round(v, 4)
+                    break
+
+        # Rentabilidades desde tablas
+        for tabla in soup.find_all("table"):
+            for fila in tabla.find_all("tr"):
+                celdas = [td.get_text(strip=True) for td in fila.find_all("td")]
+                if len(celdas) < 2:
+                    continue
+                label = celdas[0].lower()
+                raw   = celdas[1].replace(",", ".").replace("%", "").strip()
+                v     = _f(raw)
+                if v is None:
+                    continue
+                if any(x in label for x in ["año en curso", "ytd", "acum. año"]):
+                    datos["ytd"] = v
+                elif "1 mes" in label:
+                    datos["1m"] = v
+                elif "3 mes" in label:
+                    datos["3m"] = v
+                elif any(x in label for x in ["1 año", "12 mes"]):
+                    datos["1y"] = v
+                elif "duraci" in label:
+                    datos["duracion"] = v
+                elif "ytm" in label or "rendim" in label:
+                    datos["ytm"] = v
 
         # Estrellas
-        stars = row.get("StarRating")
-        if stars:
-            try:
-                datos["estrellas"] = int(stars)
-            except (ValueError, TypeError):
-                pass
+        for img in soup.find_all("img"):
+            alt = (img.get("alt") or img.get("title") or "").lower()
+            if "estrell" in alt or "star" in alt:
+                for ch in alt:
+                    if ch.isdigit():
+                        datos["estrellas"] = int(ch)
+                        break
 
-        resultado[sec_id] = datos
-        nombre = row.get("LegalName", "")[:40]
-        log.info(
-            f"  ✓ {sec_id} ({nombre}) "
-            f"NAV={datos.get('nav')} "
-            f"YTD={datos.get('ytd')}% "
-            f"1M={datos.get('1m')}% "
-            f"1Y={datos.get('1y')}%"
-        )
+    except Exception as e:
+        log.warning(f"Ficha {ms_id}: {e}")
 
-    return resultado
+    return datos
 
 
-# ─── COLUMNAS EXCEL ───────────────────────────────────────────────────────
+# ─── CACHÉ DE IDs PARA NO BUSCAR CADA DÍA ────────────────────────────────
+# Se construye en la primera ejecución y se reutiliza
+_CACHE_IDS = {}
+
+def obtener_datos_fondo(isin: str, nombre: str) -> dict:
+    """Busca el ID si no lo tenemos y luego obtiene los datos."""
+    global _CACHE_IDS
+
+    ms_id = _CACHE_IDS.get(isin)
+    if not ms_id:
+        ms_id, nombre_ms = buscar_id_por_isin(isin)
+        if ms_id:
+            _CACHE_IDS[isin] = ms_id
+            log.info(f"  ISIN {isin} → ID {ms_id} ({nombre_ms[:40]})")
+        else:
+            log.warning(f"  ISIN {isin} no encontrado en Morningstar ({nombre})")
+            return {}
+        time.sleep(0.5)
+
+    datos = obtener_datos_por_id(ms_id)
+    return datos
+
+
+# ─── ACTUALIZAR EXCEL ─────────────────────────────────────────────────────
 AZUL_CL = "D6E4F0"
 BLANCO  = "FFFFFF"
 AZUL_H  = "1F4E79"
@@ -235,41 +223,22 @@ def actualizar_excel():
         c.border    = thin
         ws.column_dimensions[get_column_letter(col)].width = 10
 
-    # Recoger todos los ISINs y sus filas
-    filas = {}
+    fondos_ok  = 0
+    sin_datos  = []
+
     for row in range(3, ws.max_row + 1):
-        isin = ws.cell(row=row, column=2).value
+        isin   = ws.cell(row=row, column=2).value
+        nombre = ws.cell(row=row, column=1).value or ""
         if not isin or str(isin).strip() == "":
             continue
-        isin = str(isin).strip()
-        ms_id = ISIN_A_MS.get(isin)
-        if ms_id:
-            filas[ms_id] = row
-        else:
-            nombre = ws.cell(row=row, column=1).value
-            log.warning(f"Sin ID MS: {isin} ({nombre})")
-            bg_row = AZUL_CL if row % 2 == 1 else BLANCO
-            celda(ws, row, COL_ACTUALIZ, hoy, bg_row)
-
-    # Consultar en lotes de 10
-    todos_ids  = list(filas.keys())
-    todos_datos = {}
-    for i in range(0, len(todos_ids), 10):
-        lote = todos_ids[i:i+10]
-        log.info(f"Consultando lote {i//10+1}: {lote}")
-        res = obtener_datos_lote(lote)
-        todos_datos.update(res)
-        time.sleep(1.0)
-
-    # Escribir en Excel
-    fondos_ok = 0
-    sin_datos = []
-    for ms_id, row in filas.items():
+        isin   = str(isin).strip()
         bg_row = AZUL_CL if row % 2 == 1 else BLANCO
-        datos  = todos_datos.get(ms_id, {})
+
+        log.info(f"Procesando: {isin} — {str(nombre)[:35]}")
+        datos = obtener_datos_fondo(isin, str(nombre))
+        time.sleep(1.2)
 
         if not datos:
-            nombre = ws.cell(row=row, column=1).value
             sin_datos.append(str(nombre)[:40])
             celda(ws, row, COL_ACTUALIZ, hoy, bg_row)
             continue
@@ -277,7 +246,8 @@ def actualizar_excel():
         if datos.get("nav"):
             celda(ws, row, COL_NAV, datos["nav"], bg_row, fmt="#,##0.0000")
         if datos.get("ytd") is not None:
-            celda(ws, row, COL_YTD, datos["ytd"]/100, bg_rent(datos["ytd"]), fmt="0.00%", bold=abs(datos["ytd"])>5)
+            celda(ws, row, COL_YTD, datos["ytd"]/100,
+                  bg_rent(datos["ytd"]), fmt="0.00%", bold=abs(datos["ytd"])>5)
         for col, key in [(COL_1M,"1m"),(COL_3M,"3m"),(COL_1Y,"1y")]:
             if datos.get(key) is not None:
                 celda(ws, row, col, datos[key]/100, bg_rent(datos[key]), fmt="0.00%")
@@ -290,6 +260,13 @@ def actualizar_excel():
 
         celda(ws, row, COL_ACTUALIZ, hoy, bg_row)
         fondos_ok += 1
+        log.info(
+            f"  ✓ NAV={datos.get('nav')} "
+            f"YTD={datos.get('ytd')}% "
+            f"1M={datos.get('1m')}% "
+            f"3M={datos.get('3m')}% "
+            f"1Y={datos.get('1y')}%"
+        )
 
     # Historial
     if "Historial" not in wb.sheetnames:
@@ -302,7 +279,7 @@ def actualizar_excel():
     wlog.cell(nr, 1, hoy)
     wlog.cell(nr, 2, fondos_ok)
     wlog.cell(nr, 3, ", ".join(sin_datos) if sin_datos else "—")
-    wlog.cell(nr, 4, "v5")
+    wlog.cell(nr, 4, "v6 - búsqueda por ISIN")
 
     buf = BytesIO()
     wb.save(buf)
@@ -324,14 +301,14 @@ def enviar_email(excel_bytes, fondos_ok, sin_datos):
     sin_html = ""
     if sin_datos:
         items = "".join(f"<li>{f}</li>" for f in sin_datos)
-        sin_html = f"<p style='color:#888;font-size:11px'>⚠️ Sin datos: <ul>{items}</ul></p>"
+        sin_html = f"<p style='color:#888;font-size:11px'>⚠️ Sin datos en Morningstar:<ul>{items}</ul></p>"
 
     cuerpo = f"""
     <html><body style="font-family:Arial,sans-serif;color:#333">
     <h2 style="color:#1F4E79">📊 Fondos de Inversión — {hoy_str}</h2>
-    <p><strong>{fondos_ok} fondos</strong> actualizados con NAV, YTD, 1M, 3M, 1Y, duración y YTM.</p>
+    <p><strong>{fondos_ok} fondos</strong> actualizados con NAV, YTD, 1M, 3M, 1Y.</p>
     {sin_html}
-    <p style="color:#888;font-size:11px">Fuente: Morningstar ES · GitHub Actions v5</p>
+    <p style="color:#888;font-size:11px">Fuente: Morningstar ES · GitHub Actions v6</p>
     </body></html>
     """
     msg.attach(MIMEText(cuerpo, "html"))
@@ -349,7 +326,7 @@ def enviar_email(excel_bytes, fondos_ok, sin_datos):
 
 
 if __name__ == "__main__":
-    log.info("═══ Inicio actualización v5 ═══")
+    log.info("═══ Inicio actualización v6 ═══")
     excel_buf, fondos_ok, sin_datos = actualizar_excel()
     enviar_email(excel_buf, fondos_ok, sin_datos)
     log.info("═══ Proceso completado ═══")
