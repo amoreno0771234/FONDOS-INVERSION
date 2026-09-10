@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "30 7 * * 1-5"
   workflow_dispatch:
+    inputs:
+      sin_email:
+        description: "Modo prueba: actualizar Excel sin enviar correo (1 = sí)"
+        required: false
+        default: "0"
 
 jobs:
   actualizar-y-enviar:
@@ -20,13 +25,16 @@ jobs:
           python-version: "3.11"
 
       - name: Instalar dependencias
-        run: pip install -r requirements.txt
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Actualizar fondos y enviar email
         env:
           EMAIL_REMITENTE: ${{ secrets.EMAIL_REMITENTE }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           EMAIL_DESTINO: ${{ secrets.EMAIL_DESTINO }}
+          SIN_EMAIL: ${{ github.event.inputs.sin_email || '0' }}
         run: python actualizar_fondos.py
 
       - name: Guardar Excel actualizado
