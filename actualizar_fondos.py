@@ -1,5 +1,5 @@
 """
-actualizar_fondos.py  v8
+actualizar_fondos.py  v8.1
 ────────────────────────
 Fuente principal: API pública del buscador (screener) de Morningstar, consultada por ISIN.
 Respaldo: página de snapshot de Morningstar ES (método de la v7).
@@ -34,13 +34,11 @@ HEADERS = {
     "Accept-Language": "es-ES,es;q=0.9",
 }
 
-# IDs correctos verificados de Morningstar ES
+# IDs de Morningstar ES (solo para el método de respaldo)
 ISIN_A_MS = {
     "FR0010830885": "F00000XNKY",
     "LU1882473264": "F00000T1ZR",
-    "FR0013399633": "F00001BSCK",
     "LU1882449801": "F00001BHQK",
-    "LU0830528907": "F0GBR063CP",
     "LU0906524193": "F00000YM0O",
     "LU1880401523": "F0GBR04R1K",
     "LU1706854152": "F00001BSIO",
@@ -48,21 +46,12 @@ ISIN_A_MS = {
     "LU0658026603": "F00000NCI5",
     "LU0151324422": "F0GBR04GYK",
     "LU0252128276": "F0GBR04GYL",
-    "FR0014008AI4": "F00001DLBY",
-    "FR0014000J453": "F00001EO44",
     "LU0336084032": "F0GBR04QEK",
     "FR0010149120": "F0GBR04QEJ",
     "LU1966822956": "F00001DTXY",
     "LU1694789451": "F00001AK5D",
-    "LU0343303002": "F0GBR06BXC",
     "LU1161527038": "F00000VXYT",
-    "FR0010334495": "F0GBR04QEO",
     "LU0512127621": "F0GBR06BXX",
-    "IE0000BTZZE8": "F00001GBA5",
-    "IE000WFO9P18": "F00001HC6T",
-    "IE0000M5MJ59": "F00001EM4X",
-    "IE0000M53C66": "F00001GMLT",
-    "LU0300ZRW254": "F0GBR06BXR",
     "IE00B84J9L26": "F00000OUQB",
     "ES0173829047": "F0GBR04IFH",
     "LU2917874104": "F00001N9KY",
@@ -84,8 +73,22 @@ def _f(val):
 
 SCREENER_HOSTS = [
     "https://lt.morningstar.com/api/rest.svc/klr5zyak8x/security/screener",
-    "https://tools.morningstar.es/api/rest.svc/klr5zyak8x/security/screener",
 ]
+
+# ISIN erróneos en el Excel → ISIN correcto (se corrigen solos en la columna B)
+CORRECCIONES_ISIN = {
+    "FR0013399633": "FR0011399633",   # Amundi Euro Liquidity Short Term Govies E (C)
+    "LU0830528907": "LU0839528907",   # Amundi Funds Euro Corporate Bond Select A2 EUR (C)
+    "FR0014008AI4": "FR001400KAV4",   # Carmignac Credit 2029 A EUR Acc
+    "FR0014000J453": "FR001400U4S3",  # Carmignac Credit 2031 A EUR Acc
+    "LU0343303002": "LU0034353002",   # DWS Floating Rate Notes LC
+    "FR0010334495": "FR0011034495",   # EdR SICAV Financial Bonds A EUR
+    "IE0000BTZZE8": "IE00008TZ2E8",   # Man Dynamic Income D H EUR
+    "IE000WFO9P18": "IE000WFG9PJ8",   # Man Dynamic Income DB H EUR
+    "IE0000M5MJ59": "IE000JM1MJ59",   # Man Euro Corporate Bond D EUR
+    "IE0000M53C66": "IE000MI53C66",   # Man Global Investment Grade Opportunities D H EUR
+    "LU0300ZRW254": "IE00BDZRWZ54",   # Neuberger Berman Short Duration EMD EUR A Acc
+}
 SCREENER_UNIVERSOS = ["FOESP$$ALL", "FOEUR$$ALL", "FOGBR$$ALL"]
 SCREENER_CAMPOS = "SecId|Name|ClosePrice|ClosePriceDate|ReturnM0|ReturnM1|ReturnM3|ReturnM12|StarRatingM255"
 
@@ -128,11 +131,8 @@ def obtener_datos_screener(isin: str) -> dict:
 
 
 def obtener_datos_snapshot(ms_id: str) -> dict:
-    """
-    Obtiene datos del snapshot de Morningstar ES (tab=0 y tab=1).
-    """
+    """Obtiene datos del snapshot de Morningstar ES (tab=0 y tab=1)."""
     datos = {}
-
     for tab in [0, 1]:
         url = f"https://www.morningstar.es/es/funds/snapshot/snapshot.aspx?id={ms_id}&tab={tab}"
         try:
@@ -141,16 +141,9 @@ def obtener_datos_snapshot(ms_id: str) -> dict:
                 log.info(f"    snapshot tab={tab}: HTTP {r.status_code}")
                 continue
             soup = BeautifulSoup(r.text, "html.parser")
-
             if tab == 0:
-                # NAV desde la cabecera del snapshot
-                for sel in [
-                    "div.snapshotTitleBox span.price",
-                    "span.price",
-                    "div.overviewKeyStatsTable td.value",
-                ]:
-                    tags = soup.select(sel)
-                    for tag in tags:
+                for sel in ["div.snapshotTitleBox span.price", "span.price", "div.overviewKeyStatsTable td.value"]:
+                    for tag in soup.select(sel):
                         txt = tag.get_text(strip=True).replace(".", "").replace(",", ".")
                         v = _f(txt)
                         if v and 0.01 < v < 999999:
@@ -158,8 +151,6 @@ def obtener_datos_snapshot(ms_id: str) -> dict:
                             break
                     if "nav" in datos:
                         break
-
-                # Estrellas
                 star_span = soup.find("span", class_=lambda c: c and "star" in c.lower())
                 if star_span:
                     txt = star_span.get("title", "") or star_span.get_text()
@@ -167,9 +158,7 @@ def obtener_datos_snapshot(ms_id: str) -> dict:
                         if ch.isdigit():
                             datos["estrellas"] = int(ch)
                             break
-
             elif tab == 1:
-                # Rentabilidades desde tabla de rendimiento
                 for tabla in soup.find_all("table"):
                     for fila in tabla.find_all("tr"):
                         celdas = [td.get_text(strip=True) for td in fila.find_all("td")]
@@ -192,38 +181,10 @@ def obtener_datos_snapshot(ms_id: str) -> dict:
                             datos["duracion"] = v
                         elif ("ytm" in label or "rendim" in label) and "ytm" not in datos:
                             datos["ytm"] = v
-
         except Exception as e:
             log.debug(f"Snapshot {ms_id} tab={tab}: {e}")
         time.sleep(0.5)
-
     return datos
-
-
-def buscar_ms_id(isin: str) -> str | None:
-    """Busca el ID de Morningstar por ISIN como respaldo."""
-    urls = [
-        f"https://www.morningstar.es/es/util/SecuritySearch.ashx?q={isin}&limit=3&universe=FOESP%24%24ALL%7CFOEUR%24%24ALL%7CFOIRL%24%24ALL%7CFOGBR%24%24ALL&lang=es-ES&fmt=json",
-        f"https://www.morningstar.com/api/v1/search/securities?q={isin}&universeIds=FOESP$$ALL|FOEUR$$ALL&limit=3",
-    ]
-    for url in urls:
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=10)
-            if r.status_code != 200:
-                continue
-            data = r.json()
-            for campo_lista in ["r", "results", "hits", "securities"]:
-                lista = data.get(campo_lista, [])
-                if lista:
-                    item = lista[0]
-                    for campo_id in ["id", "secId", "SecId", "i", "isin"]:
-                        v = item.get(campo_id)
-                        if v and len(str(v)) > 5:
-                            log.info(f"    Encontrado por búsqueda: {isin} → {v}")
-                            return str(v)
-        except Exception as e:
-            log.debug(f"Búsqueda {isin}: {e}")
-    return None
 
 
 # ─── EXCEL ────────────────────────────────────────────────────────────────
@@ -272,17 +233,19 @@ def actualizar_excel():
         if not isin or str(isin).strip() == "":
             continue
         isin = str(isin).strip()
+        if isin in CORRECCIONES_ISIN:
+            nuevo = CORRECCIONES_ISIN[isin]
+            log.info(f"ISIN corregido en Excel: {isin} → {nuevo} ({nombre[:35]})")
+            ws.cell(row=row, column=2, value=nuevo)
+            isin = nuevo
         bg_row = AZUL_CL if row % 2 == 1 else BLANCO
 
         log.info(f"Obteniendo: {isin} ({nombre[:35]})")
         datos = obtener_datos_screener(isin)
 
         # Respaldo: método antiguo (snapshot)
-        if not datos:
-            ms_id = ISIN_A_MS.get(isin) or buscar_ms_id(isin)
-            if ms_id:
-                ISIN_A_MS[isin] = ms_id
-                datos = obtener_datos_snapshot(ms_id)
+        if not datos and ISIN_A_MS.get(isin):
+            datos = obtener_datos_snapshot(ISIN_A_MS[isin])
         time.sleep(1.0)
 
         if not datos:
@@ -317,7 +280,7 @@ def actualizar_excel():
     nr = wlog.max_row + 1
     wlog.cell(nr, 1, hoy); wlog.cell(nr, 2, fondos_ok)
     wlog.cell(nr, 3, ", ".join(sin_datos) if sin_datos else "—")
-    wlog.cell(nr, 4, "v8")
+    wlog.cell(nr, 4, "v8.1")
 
     buf = BytesIO()
     wb.save(buf); buf.seek(0); wb.save(EXCEL_PATH)
@@ -339,7 +302,7 @@ def enviar_email(excel_bytes, fondos_ok, sin_datos):
     <h2 style="color:#1F4E79">📊 Fondos de Inversión — {hoy_str}</h2>
     <p><strong>{fondos_ok} fondos</strong> actualizados con NAV, YTD, 1M, 3M, 1Y.</p>
     {sin_html}
-    <p style="color:#888;font-size:11px">Fuente: Morningstar · GitHub Actions v8</p>
+    <p style="color:#888;font-size:11px">Fuente: Morningstar · GitHub Actions v8.1</p>
     </body></html>"""
     msg.attach(MIMEText(cuerpo, "html"))
     parte = MIMEBase("application", "octet-stream")
@@ -354,7 +317,7 @@ def enviar_email(excel_bytes, fondos_ok, sin_datos):
 
 
 if __name__ == "__main__":
-    log.info("═══ Inicio actualización v8 ═══")
+    log.info("═══ Inicio actualización v8.1 ═══")
     excel_buf, fondos_ok, sin_datos = actualizar_excel()
     if fondos_ok == 0:
         log.warning("⚠️ Ningún fondo ha devuelto datos: revisa las líneas 'screener'/'snapshot' de arriba.")
