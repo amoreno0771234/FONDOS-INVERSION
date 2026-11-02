@@ -1,8 +1,9 @@
 """
-actualizar_fondos.py  v7
+actualizar_fondos.py  v8
 ────────────────────────
-Combina IDs conocidos (fiables) con búsqueda por ISIN como respaldo.
-Usa el endpoint de snapshot de Morningstar para obtener los datos.
+Fuente principal: API pública del buscador (screener) de Morningstar, consultada por ISIN.
+Respaldo: página de snapshot de Morningstar ES (método de la v7).
+Si un fondo no devuelve datos, el log de GitHub indica qué respondió Morningstar.
 """
 
 import os, time, datetime, smtplib, logging
@@ -68,7 +69,6 @@ ISIN_A_MS = {
     "LU1551754515": "F00001AX9D",
     "LU0243957239": "F0GBR04QEG",
     "IE00B65YMK29": "F00000OUQC",
-    "LU0300ZRW254": "F0GBR06BXR",
 }
 
 
@@ -82,6 +82,51 @@ def _f(val):
         return None
 
 
+SCREENER_HOSTS = [
+    "https://lt.morningstar.com/api/rest.svc/klr5zyak8x/security/screener",
+    "https://tools.morningstar.es/api/rest.svc/klr5zyak8x/security/screener",
+]
+SCREENER_UNIVERSOS = ["FOESP$$ALL", "FOEUR$$ALL", "FOGBR$$ALL"]
+SCREENER_CAMPOS = "SecId|Name|ClosePrice|ClosePriceDate|ReturnM0|ReturnM1|ReturnM3|ReturnM12|StarRatingM255"
+
+
+def obtener_datos_screener(isin: str) -> dict:
+    """Consulta el screener de Morningstar filtrando por ISIN. Devuelve NAV, YTD, 1M, 3M, 1A y estrellas."""
+    for host in SCREENER_HOSTS:
+        for univ in SCREENER_UNIVERSOS:
+            params = {
+                "page": 1, "pageSize": 5, "sortOrder": "LegalName asc", "outputType": "json",
+                "version": 1, "languageId": "es-ES", "currencyId": "EUR",
+                "universeIds": univ, "securityDataPoints": SCREENER_CAMPOS, "term": isin,
+            }
+            try:
+                r = requests.get(host, params=params, headers={**HEADERS, "Accept": "application/json"}, timeout=20)
+                if r.status_code != 200:
+                    log.info(f"    screener {host.split('/')[2]} {univ}: HTTP {r.status_code}")
+                    continue
+                filas = (r.json() or {}).get("rows") or []
+                if not filas:
+                    continue
+                f = filas[0]
+                datos = {}
+                if _f(f.get("ClosePrice")):
+                    datos["nav"] = round(_f(f.get("ClosePrice")), 4)
+                for clave, campo in [("ytd", "ReturnM0"), ("1m", "ReturnM1"), ("3m", "ReturnM3"), ("1y", "ReturnM12")]:
+                    v = _f(f.get(campo))
+                    if v is not None:
+                        datos[clave] = v
+                est = _f(f.get("StarRatingM255"))
+                if est:
+                    datos["estrellas"] = int(est)
+                if datos:
+                    log.info(f"    screener OK ({univ}): {f.get('Name', '')[:40]} · fecha NAV {f.get('ClosePriceDate', '')}")
+                    return datos
+            except Exception as e:
+                log.info(f"    screener {host.split('/')[2]} {univ}: error {type(e).__name__}: {str(e)[:120]}")
+            time.sleep(0.3)
+    return {}
+
+
 def obtener_datos_snapshot(ms_id: str) -> dict:
     """
     Obtiene datos del snapshot de Morningstar ES (tab=0 y tab=1).
@@ -93,6 +138,7 @@ def obtener_datos_snapshot(ms_id: str) -> dict:
         try:
             r = requests.get(url, headers=HEADERS, timeout=20)
             if r.status_code != 200:
+                log.info(f"    snapshot tab={tab}: HTTP {r.status_code}")
                 continue
             soup = BeautifulSoup(r.text, "html.parser")
 
@@ -166,7 +212,6 @@ def buscar_ms_id(isin: str) -> str | None:
             if r.status_code != 200:
                 continue
             data = r.json()
-            # Intentar varios formatos de respuesta
             for campo_lista in ["r", "results", "hits", "securities"]:
                 lista = data.get(campo_lista, [])
                 if lista:
@@ -229,21 +274,15 @@ def actualizar_excel():
         isin = str(isin).strip()
         bg_row = AZUL_CL if row % 2 == 1 else BLANCO
 
-        # Obtener ID de Morningstar
-        ms_id = ISIN_A_MS.get(isin)
-        if not ms_id:
-            ms_id = buscar_ms_id(isin)
+        log.info(f"Obteniendo: {isin} ({nombre[:35]})")
+        datos = obtener_datos_screener(isin)
+
+        # Respaldo: método antiguo (snapshot)
+        if not datos:
+            ms_id = ISIN_A_MS.get(isin) or buscar_ms_id(isin)
             if ms_id:
                 ISIN_A_MS[isin] = ms_id
-
-        if not ms_id:
-            log.warning(f"Sin ID: {isin} ({nombre[:35]})")
-            sin_datos.append(nombre[:40])
-            celda(ws, row, COL_ACTUALIZ, hoy, bg_row)
-            continue
-
-        log.info(f"Obteniendo: {isin} → {ms_id} ({nombre[:35]})")
-        datos = obtener_datos_snapshot(ms_id)
+                datos = obtener_datos_snapshot(ms_id)
         time.sleep(1.0)
 
         if not datos:
@@ -278,7 +317,7 @@ def actualizar_excel():
     nr = wlog.max_row + 1
     wlog.cell(nr, 1, hoy); wlog.cell(nr, 2, fondos_ok)
     wlog.cell(nr, 3, ", ".join(sin_datos) if sin_datos else "—")
-    wlog.cell(nr, 4, "v7")
+    wlog.cell(nr, 4, "v8")
 
     buf = BytesIO()
     wb.save(buf); buf.seek(0); wb.save(EXCEL_PATH)
@@ -300,7 +339,7 @@ def enviar_email(excel_bytes, fondos_ok, sin_datos):
     <h2 style="color:#1F4E79">📊 Fondos de Inversión — {hoy_str}</h2>
     <p><strong>{fondos_ok} fondos</strong> actualizados con NAV, YTD, 1M, 3M, 1Y.</p>
     {sin_html}
-    <p style="color:#888;font-size:11px">Fuente: Morningstar ES · GitHub Actions v7</p>
+    <p style="color:#888;font-size:11px">Fuente: Morningstar · GitHub Actions v8</p>
     </body></html>"""
     msg.attach(MIMEText(cuerpo, "html"))
     parte = MIMEBase("application", "octet-stream")
@@ -315,8 +354,10 @@ def enviar_email(excel_bytes, fondos_ok, sin_datos):
 
 
 if __name__ == "__main__":
-    log.info("═══ Inicio actualización v7 ═══")
+    log.info("═══ Inicio actualización v8 ═══")
     excel_buf, fondos_ok, sin_datos = actualizar_excel()
+    if fondos_ok == 0:
+        log.warning("⚠️ Ningún fondo ha devuelto datos: revisa las líneas 'screener'/'snapshot' de arriba.")
     if SIN_EMAIL:
         log.info("Modo prueba (SIN_EMAIL=1): Excel actualizado, no se envía correo.")
     else:
